@@ -13,6 +13,7 @@ Features:
 - Pre-checkout and successful payment handlers
 - Auto-zip with OTP password delivery after successful payment
 - SQLite for metadata & logs
+- Admin price management (/setprice, /setpriceprod, /getprices, /delprice)
 
 Single-file runnable example. Edit ENV variables below before running.
 
@@ -40,6 +41,7 @@ import sqlite3
 import logging
 import secrets
 import zipfile
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, executor, types
@@ -55,6 +57,7 @@ ADMIN_IDS = set(int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip
 DATA_DIR = Path('./data')
 FILES_DIR = DATA_DIR / 'files'
 DB_PATH = DATA_DIR / 'market.db'
+PRICE_FILE = DATA_DIR / 'prices.json'
 
 # Safety reminder
 SAFETY_NOTICE = (
@@ -103,6 +106,24 @@ def init_db():
 
 init_db()
 
+# Price list helpers (persisted JSON)
+def load_prices():
+    if PRICE_FILE.exists():
+        try:
+            return json.loads(PRICE_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+    return {}
+
+def save_prices(prices: dict):
+    PRICE_FILE.write_text(json.dumps(prices, indent=2), encoding='utf-8')
+
+# initialize price file with DEFAULT if missing
+prices = load_prices()
+if 'DEFAULT' not in prices:
+    prices['DEFAULT'] = 10000  # default 100.00 INR (in paise)
+    save_prices(prices)
+
 # util functions
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -145,11 +166,18 @@ def record_sale(product_id: int, buyer_id: int, price: int):
 # Admin: /start
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    txt = "Welcome to the Safe Marketplace Bot!\n" + SAFETY_NOTICE
+    txt = "Welcome to the Safe Marketplace Bot!
+" + SAFETY_NOTICE
     if is_admin(message.from_user.id):
-        txt += "\n\nYou are an admin. Use /addfile to upload a product, /stock to view inventory."
+        txt += "
+
+You are an admin. Use /addfile to upload a product, /stock to view inventory.
+" \
+               "Use /setprice <COUNTRY> <PAISE> or /setpriceprod <PRODUCT_ID> <PAISE> to set prices."
     else:
-        txt += "\n\nUse /shop to browse available products."
+        txt += "
+
+Use /shop to browse available products."
     await message.reply(txt)
 
 # Admin: upload file
@@ -168,13 +196,15 @@ async def cmd_addfile(message: types.Message):
 async def add_name(message: types.Message):
     ADD_CTX[message.from_user.id]['display_name'] = message.text[:200]
     ADD_CTX[message.from_user.id]['stage'] = 'ask_price'
-    await message.reply('Price in paise (example: 49900 for ₹499). Send numeric price:')
+    await message.reply('Price in paise (example: 49900 for ₹499). Send numeric price.
+' \
+                        'If you want to use country-based pricing, send 0 here and set prices via /setprice.')
 
 @dp.message_handler(lambda m: m.from_user.id in ADD_CTX and ADD_CTX[m.from_user.id]['stage']=='ask_price')
 async def add_price(message: types.Message):
     txt = message.text.strip()
     if not txt.isdigit():
-        return await message.reply('Please send price as integer paise only (e.g., 49900).')
+        return await message.reply('Please send price as integer paise only (e.g., 49900) or 0 to use country pricing.')
     ADD_CTX[message.from_user.id]['price'] = int(txt)
     ADD_CTX[message.from_user.id]['stage'] = 'ask_country'
     await message.reply('Country tag (e.g., India, USA, Other). This is used for filtering in /shop.')
@@ -188,8 +218,9 @@ async def add_country(message: types.Message):
 @dp.message_handler(content_types=types.ContentType.DOCUMENT)
 async def receive_document(message: types.Message):
     uid = message.from_user.id
+    # allow only when in addfile flow OR ignore otherwise
     if uid not in ADD_CTX or ADD_CTX[uid]['stage'] != 'ask_file':
-        return  # not in upload flow
+        return
 
     doc = message.document
     file_name = doc.file_name
@@ -200,7 +231,8 @@ async def receive_document(message: types.Message):
     info = ADD_CTX.pop(uid)
     product_id = add_product(filename=str(saved_path.name), display_name=info['display_name'],
                              country=info['country'], price=info['price'], uploaded_by=uid)
-    await message.reply(f"Product saved with id {product_id}. It is now available in /shop.\n{SAFETY_NOTICE}")
+    await message.reply(f"Product saved with id {product_id}. It is now available in /shop.
+{SAFETY_NOTICE}")
 
 # Admin: view stock
 @dp.message_handler(commands=['stock'])
@@ -219,7 +251,66 @@ async def cmd_stock(message: types.Message):
         else:
             pid, name, country, price, sold = r
         txt_lines.append(f"{pid} | {name} | {country} | {price} | {sold}")
-    await message.reply('\n'.join(txt_lines))
+    await message.reply('
+'.join(txt_lines))
+
+# Price commands
+@dp.message_handler(commands=['setprice'])
+async def cmd_setprice(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply('Only admins can set prices.')
+    parts = message.text.split()
+    if len(parts) != 3:
+        return await message.reply('Usage: /setprice <COUNTRY_KEY> <PRICE_IN_PAISE>
+Example: /setprice IN 5000')
+    key = parts[1].upper()
+    if not parts[2].isdigit():
+        return await message.reply('Price must be integer (paise). Example: 5000 for ₹50')
+    price_val = int(parts[2])
+    prices = load_prices()
+    prices[key] = price_val
+    save_prices(prices)
+    await message.reply(f'Price for {key} set to {price_val} paise (₹{price_val/100:.2f})')
+
+@dp.message_handler(commands=['setpriceprod'])
+async def cmd_setpriceprod(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply('Only admins can set product prices.')
+    parts = message.text.split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        return await message.reply('Usage: /setpriceprod <PRODUCT_ID> <PRICE_IN_PAISE>')
+    pid = int(parts[1])
+    price_val = int(parts[2])
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute('UPDATE products SET price=? WHERE id=?', (price_val, pid))
+        conn.commit()
+    await message.reply(f'Product {pid} price updated to {price_val} paise (₹{price_val/100:.2f})')
+
+@dp.message_handler(commands=['getprices'])
+async def cmd_getprices(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply('Only admins can view prices.')
+    prices = load_prices()
+    lines = [f"{k}: {v} paise (₹{v/100:.2f})" for k, v in prices.items()]
+    await message.reply('
+'.join(lines))
+
+@dp.message_handler(commands=['delprice'])
+async def cmd_delprice(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply('Only admins can delete prices.')
+    parts = message.text.split()
+    if len(parts) != 2:
+        return await message.reply('Usage: /delprice <COUNTRY_KEY>')
+    key = parts[1].upper()
+    prices = load_prices()
+    if key in prices:
+        prices.pop(key)
+        save_prices(prices)
+        await message.reply(f'Price for {key} removed.')
+    else:
+        await message.reply(f'No price set for {key}.')
 
 # User: /shop -> choose country
 @dp.message_handler(commands=['shop'])
@@ -249,16 +340,23 @@ async def shop_country_selected(message: types.Message):
     # present options inline
     for r in rows:
         pid, name, country, price = r
-        price_display = f"₹{price/100:.2f}"
+        # if product price is 0 use country pricing
+        display_price = price
+        if display_price == 0:
+            prices = load_prices()
+            display_price = prices.get(country.upper(), prices.get('DEFAULT', 10000))
+        price_display = f"₹{display_price/100:.2f}"
         kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton(text=f"Buy {price_display}", callback_data=f"buy:{pid}"))
+        kb.add(types.InlineKeyboardButton(text=f"Buy {price_display}", callback_data=f"buy:{pid}:{display_price}"))
         await message.reply(f"ID:{pid} | {name} | {country} | {price_display}", reply_markup=kb)
     await message.reply('To cancel keyboard press /start', reply_markup=types.ReplyKeyboardRemove())
 
 # Callback to start purchase
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('buy:'))
 async def process_buy_callback(callback_query: types.CallbackQuery):
-    pid = int(callback_query.data.split(':')[1])
+    parts = callback_query.data.split(':')
+    pid = int(parts[1])
+    requested_price = int(parts[2]) if len(parts) > 2 else None
     # look up product
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -266,17 +364,27 @@ async def process_buy_callback(callback_query: types.CallbackQuery):
         row = cur.fetchone()
     if not row:
         return await callback_query.answer('Product not available anymore.', show_alert=True)
-    _, display_name, price = row
+    _, display_name, stored_price = row
+    # determine effective price: product price if non-zero else requested_price
+    if stored_price and stored_price > 0:
+        effective_price = stored_price
+    elif requested_price:
+        effective_price = requested_price
+    else:
+        # fallback to DEFAULT
+        prices = load_prices()
+        effective_price = prices.get('DEFAULT', 10000)
+
     # send invoice
-    prices = [LabeledPrice(label=display_name, amount=price)]
+    prices_lp = [LabeledPrice(label=display_name, amount=effective_price)]
     await bot.send_invoice(callback_query.from_user.id,
                            title=display_name,
                            description=f'Purchase: {display_name}',
-                           payload=f'purchase:{pid}',
+                           payload=f'purchase:{pid}:{effective_price}',
                            provider_token=PAYMENT_PROVIDER_TOKEN or 'TEST',
                            currency='INR',
-                           prices=prices,
-                           start_parameter=f'pay-{pid}')
+                           prices=prices_lp,
+                           start_parameter=f'pay-{pid}-{secrets.token_hex(4)}')
     await callback_query.answer()
 
 # Pre-checkout (required)
@@ -289,10 +397,14 @@ async def pre_checkout(pre_checkout_q: types.PreCheckoutQuery):
 @dp.message_handler(content_types=types.ContentType.SUCCESSFUL_PAYMENT)
 async def got_payment(message: types.Message):
     payload = message.successful_payment.invoice_payload
-    # payload format: purchase:{pid}
+    # payload format: purchase:{pid}:{price}
     if not payload.startswith('purchase:'):
         return await message.reply('Unknown payment payload.')
-    pid = int(payload.split(':')[1])
+    parts = payload.split(':')
+    if len(parts) < 3:
+        return await message.reply('Invalid payload format.')
+    pid = int(parts[1])
+    paid_amount = int(parts[2])
 
     # mark product sold and record sale
     with sqlite3.connect(DB_PATH) as conn:
@@ -301,23 +413,23 @@ async def got_payment(message: types.Message):
         row = cur.fetchone()
         if not row:
             return await message.reply('Product not available or already sold.')
-        filename, display_name, price = row
+        filename, display_name, stored_price = row
+
         # prepare zip + otp
         otp = secrets.token_hex(4)  # short password
         file_path = FILES_DIR / filename
         zip_name = FILES_DIR / f"{filename}.zip"
         with zipfile.ZipFile(zip_name, 'w') as zf:
             zf.write(file_path, arcname=Path(filename).name)
-        # set zip password by rewriting using external method if needed — but python's zipfile doesn't support encrypting stored zips with password easily
-        # Workaround: include a small text file containing the OTP and instruct buyer to use OTP to rename? Simpler: send zip and send OTP as separate message.
 
-        # mark sold
+        # mark sold and record
         cur.execute('UPDATE products SET sold=1, otp=? WHERE id=?', (otp, pid))
-        cur.execute('INSERT INTO sales (product_id,buyer_id,price) VALUES (?,?,?)', (pid, message.from_user.id, price))
+        cur.execute('INSERT INTO sales (product_id,buyer_id,price) VALUES (?,?,?)', (pid, message.from_user.id, paid_amount))
         conn.commit()
 
     # send the zip file (telegram file size limits still apply)
-    await message.reply('\n'.join([
+    await message.reply('
+'.join([
         f'✅ Payment received for {display_name}.',
         'File attached below. Use the OTP to unlock the delivered product.'
     ]))
@@ -352,7 +464,9 @@ async def cmd_stats(message: types.Message):
         sold = cur.fetchone()[0]
         cur.execute('SELECT COUNT(*) FROM sales')
         sales = cur.fetchone()[0]
-    await message.reply(f'Total products: {total}\nSold items: {sold}\nSales records: {sales}')
+    await message.reply(f'Total products: {total}
+Sold items: {sold}
+Sales records: {sales}')
 
 # Run
 if __name__ == '__main__':
