@@ -1,0 +1,5 @@
+python-dotenv
+aiogram==2.25.1
+sqlalchemy
+pytz
+requests
